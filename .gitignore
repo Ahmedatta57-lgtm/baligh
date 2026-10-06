@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+baligh_db/
+.env
+*.swp
+*.save
+*~
+.DS_Store
