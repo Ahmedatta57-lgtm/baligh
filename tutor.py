@@ -3,20 +3,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import chromadb
-from google import genai
 import json
 import random
 import re
 import time
 import os
 
+# ============ GEMINI CLOUD AI ============
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
-USE_GEMINI = bool(GEMINI_KEY)
+gemini_client = None
+USE_GEMINI = False
 GEMINI_MODEL = "gemini-2.5-flash"
+
+try:
+    if GEMINI_KEY:
+        from google import genai
+        gemini_client = genai.Client(api_key=GEMINI_KEY)
+        USE_GEMINI = True
+        print("Gemini client initialized")
+    else:
+        print("⚠️ GEMINI_API_KEY not set — will use fallback scoring")
+except Exception as e:
+    print(f"⚠️ Gemini init failed: {e} — will use fallback scoring")
+    gemini_client = None
+    USE_GEMINI = False
 
 _ANSWER_CACHE = {}
 _CACHE_MAX = 50
+
+# ============ STUDENT DATA ============
 
 STUDENTS: Dict[str, Dict[str, Any]] = {}
 
@@ -136,15 +151,32 @@ def check_achievements(student):
     for a in new: student["achievements"].append(a)
     return new
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# ============ APP + CORS ============
 
-client = chromadb.PersistentClient(path="./baligh_db")
-col = client.get_or_create_collection("arabic_grammar")
-if col.count() == 0:
-    for i, r in enumerate(["الفاعل مرفوع", "المفعول به منصوب"]):
-        col.add(documents=[r], ids=["rule_" + str(i)])
-    print("Loaded rules")
+app = FastAPI()
+
+# CORS - allow everything (most permissive, works on Vercel)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Now try to load chromadb (won't crash if it fails)
+try:
+    client = chromadb.PersistentClient(path="./baligh_db")
+    col = client.get_or_create_collection("arabic_grammar")
+    if col.count() == 0:
+        for i, r in enumerate(["الفاعل مرفوع", "المفعول به منصوب"]):
+            col.add(documents=[r], ids=["rule_" + str(i)])
+        print("Loaded rules")
+    else:
+        print("Rules already loaded")
+except Exception as e:
+    print(f"⚠️ ChromaDB failed: {e}")
+    col = None
 
 # ============ TEXT UTILS ============
 
@@ -181,6 +213,19 @@ def similarity(a, b):
     m = max(len(a), len(b))
     return 1.0 if m == 0 else 1.0 - (levenshtein(a, b) / m)
 
+def simple_match(el, words):
+    el_n = normalize_arabic(el)
+    if not el_n: return False
+    for w in words:
+        w_n = normalize_arabic(w)
+        if not w_n: continue
+        if el_n == w_n: return True
+        if len(el_n) >= 3 and len(w_n) >= 3:
+            if el_n[:3] == w_n[:3]: return True
+            if similarity(el_n, w_n) >= 0.75: return True
+        if el_n in w_n or w_n in el_n: return True
+    return False
+
 # ============ API MODELS ============
 
 class Query(BaseModel): message: str
@@ -192,27 +237,38 @@ class StudentUpdate(BaseModel):
     seconds_taken: int = 40; first_time: bool = False
 class BuyBoxRequest(BaseModel): student_name: str = ""; box_type: str = "bronze"
 class EquipRequest(BaseModel): student_name: str = ""; item_id: str = ""; slot: str = ""
-class MiniGameScore(BaseModel):
-    student_name: str = ""
-    game_type: str = ""
-    score: float = 0
-    extra: dict = {}
+class SceneReq(BaseModel): level: int = 1; avoid: list = []
+class SpeakEval(BaseModel):
+    image_description: str = ""
+    user_transcript: str = ""
+    elements: list = []
+    topic: str = ""
+    challenge: str = "describe"
 
-# ============ HEALTH & CHAT ============
+# ============ HEALTH ============
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model": GEMINI_MODEL if USE_GEMINI else "fallback",
+        "provider": "gemini" if USE_GEMINI else "fallback",
+        "cors": "enabled",
+    }
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Baligh API", "version": "1.0"}
 
 @app.post("/chat")
 def chat(q: Query):
     try:
-        if USE_GEMINI:
+        if USE_GEMINI and gemini_client:
             r = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=q.message)
             return {"reply": clean_arabic(r.text)}
-        return {"reply": "Gemini not set"}
+        return {"reply": "Gemini not available"}
     except Exception as e:
-        return {"reply": "عذرا حدث خطا"}
-
-@app.get("/health")
-def health():
-    return {"status":"ok","model":GEMINI_MODEL if USE_GEMINI else "none","provider":"gemini" if USE_GEMINI else "none"}
+        return {"reply": f"Error: {e}"}
 
 # ============ STUDENT ============
 
@@ -394,21 +450,28 @@ def get_achievements(name: str):
 SCENES = [
     {"id":"market1","img":"images/market1.jpg","topic":"سُوق","difficulty":1,"challenge":"describe","elements":["خُضَار","فَوَاكِه","سُوق","أَلْوَان","بَائِع"],"camel":"مَرْحَبًا! أَنَا بَلِيغ. وَصَلْنَا إِلَى السُّوق. صِفْ مَا تَرَاه!"},
     {"id":"beach1","img":"images/beach1.jpg","topic":"شَاطِئ","difficulty":1,"challenge":"describe","elements":["بَحْر","شَمْس","رَمْل","سَمَاء","مَاء"],"camel":"وَصَلْنَا إِلَى البَحْر. صِفْ مَا تَرَاه."},
+    {"id":"beach2","img":"images/beach2.jpg","topic":"شَاطِئ","difficulty":1,"challenge":"describe","elements":["بَحْر","أَشْجَار","رَمْل"],"camel":"جَوّ جَمِيل هُنَا! صِفْ الصُّورَة."},
+    {"id":"market2","img":"images/market2.jpg","topic":"سُوق","difficulty":1,"challenge":"describe","elements":["خُضَار","فَوَاكِه","سُوق"],"camel":"صِفْ لِي مَا تَرَاه."},
     {"id":"zoo1","img":"images/zoo1.jpg","topic":"بَانْدَا","difficulty":2,"challenge":"question","question":"مَاذَا يَأْكُل البَانْدَا؟","elements":["بَانْدَا","يَأْكُل","خَيْزَرَان"],"camel":"هَذَا حَيَوَان البَانْدَا. مَاذَا يَأْكُل؟"},
+    {"id":"zoo2","img":"images/zoo2.jpg","topic":"حَيَوَانَات","difficulty":2,"challenge":"question","question":"مَا الحَيَوَانَات الَّتِي تَرَاهَا؟","elements":["زَرَافَة","حِمَار","طَوِيل"],"camel":"مَا هَذِهِ الحَيَوَانَات؟"},
     {"id":"kitchen1","img":"images/kitchen1.jpg","topic":"مَطْبَخ","difficulty":2,"challenge":"question","question":"مَاذَا يَفْعَل الطَّاهِي؟","elements":["مَطْبَخ","طَبْخ","طَاهِي"],"camel":"مَاذَا يَحْدُث هُنَا؟"},
-    {"id":"school1","img":"images/school1.jpg","topic":"فَصْل","difficulty":3,"challenge":"complete","start":"فِي الفَصْل أَرَى...","elements":["فَصْل","طَاوِلَات","كَرَاسِي"],"camel":"أَكْمِلْ: فِي الفَصْل أَرَى..."},
+    {"id":"kitchen2","img":"images/kitchen2.jpg","topic":"طَاهِي","difficulty":2,"challenge":"question","question":"أَيْنَ نَحْنُ؟","elements":["مَطْبَخ","طَعَام","قِدْر"],"camel":"مَنْ يَطْبُخ؟"},
+    {"id":"school1","img":"images/school1.jpg","topic":"فَصْل","difficulty":3,"challenge":"complete","start":"فِي الفَصْل أَرَى...","elements":["فَصْل","طَاوِلَات","كَرَاسِي","سَبُّورَة"],"camel":"أَكْمِلْ: فِي الفَصْل أَرَى..."},
     {"id":"library1","img":"images/library1.jpg","topic":"مَكْتَبَة","difficulty":3,"challenge":"complete","start":"فِي المَكْتَبَة أَرَى...","elements":["مَكْتَبَة","كُتُب","رُفُوف"],"camel":"أَكْمِلْ: فِي المَكْتَبَة أَرَى..."},
+    {"id":"mosque1","img":"images/mosque1.jpg","topic":"مَسْجِد","difficulty":3,"challenge":"complete","start":"المَسْجِد فِيهِ...","elements":["مَسْجِد","قُبَّة","مِئْذَنَة"],"camel":"أَكْمِلْ: المَسْجِد فِيهِ..."},
     {"id":"farm1","img":"images/farm1.jpg","topic":"مَزْرَعَة","difficulty":4,"challenge":"story","start":"كَانَ هُنَاكَ بَقَرَة...","elements":["بَقَرَة","حَقْل","مَزْرَعَة"],"camel":"اِحْكِ قِصَّة."},
-    {"id":"hospital1","img":"images/hospital1.jpg","topic":"مُسْتَشْفَى","difficulty":5,"challenge":"describe","elements":["مُسْتَشْفَى","اِسْتِقْبَال","طَبِيب"],"camel":"صِفْ بِالتَّفْصِيل."},
-    {"id":"rain1","img":"images/rain1.jpg","topic":"مَطَر","difficulty":6,"challenge":"story","start":"فِي يَوْم مُمْطِر...","elements":["مَطَر","غُيُوم","سَمَاء"],"camel":"اِحْكِ قِصَّة."},
+    {"id":"football1","img":"images/football1.jpg","topic":"كُرَة قَدَم","difficulty":4,"challenge":"story","start":"كَانَ الأَوْلَاد يَلْعَبُون...","elements":["كُرَة","مَلْعَب","هَدَف"],"camel":"اِحْكِ قِصَّة."},
+    {"id":"forest1","img":"images/forest1.jpg","topic":"غَابَة","difficulty":4,"challenge":"story","start":"فِي الغَابَة...","elements":["غَابَة","أَشْجَار","نَبَاتَات"],"camel":"اِحْكِ قِصَّة."},
+    {"id":"hospital1","img":"images/hospital1.jpg","topic":"مُسْتَشْفَى","difficulty":5,"challenge":"describe","elements":["مُسْتَشْفَى","اِسْتِقْبَال","طَبِيب","مَرِيض"],"camel":"صِفْ بِالتَّفْصِيل."},
+    {"id":"mountain1","img":"images/mountain1.jpg","topic":"جَبَل","difficulty":5,"challenge":"describe","elements":["جَبَل","قِمَم","حِجَارَة","سَمَاء"],"camel":"صِفْ مَا تَرَاه."},
+    {"id":"rain1","img":"images/rain1.jpg","topic":"مَطَر","difficulty":6,"challenge":"story","start":"فِي يَوْم مُمْطِر...","elements":["مَطَر","غُيُوم","سَمَاء","مَاء"],"camel":"اِحْكِ قِصَّة."},
+    {"id":"sunset1","img":"images/sunset1.jpg","topic":"غُرُوب","difficulty":6,"challenge":"story","start":"عِنْدَمَا تَغْرُب الشَّمْس...","elements":["غُرُوب","شَمْس","سَمَاء","أَلْوَان"],"camel":"اِحْكِ قِصَّة."},
 ]
 
 def scenes_for_level(lvl):
     d = min(6, max(1, (lvl+1)//2))
     matching = [s for s in SCENES if s["difficulty"] == d]
     return matching if matching else SCENES
-
-class SceneReq(BaseModel): level: int = 1; avoid: list = []
 
 @app.post("/speak/scene")
 def speak_scene(req: SceneReq):
@@ -420,20 +483,7 @@ def speak_scene(req: SceneReq):
         "camel":scene.get("camel","صِفْ مَا تَرَاه!"),
         "question":scene.get("question",""),"start":scene.get("start","")}
 
-# ============ EVALUATION (same as before) ============
-
-def simple_match(el, words):
-    el_n = normalize_arabic(el)
-    if not el_n: return False
-    for w in words:
-        w_n = normalize_arabic(w)
-        if not w_n: continue
-        if el_n == w_n: return True
-        if len(el_n) >= 3 and len(w_n) >= 3:
-            if el_n[:3] == w_n[:3]: return True
-            if similarity(el_n, w_n) >= 0.75: return True
-        if el_n in w_n or w_n in el_n: return True
-    return False
+# ============ EVALUATION ============
 
 def check_match(answer, elements):
     words = re.findall(r"[\u0600-\u06FF]+", answer)
@@ -475,6 +525,8 @@ def py_fusha(answer, words, challenge):
 def ai_fusha(answer, topic, challenge):
     cache_key = (answer.strip(), topic, challenge)
     if cache_key in _ANSWER_CACHE: return _ANSWER_CACHE[cache_key]
+    if not (USE_GEMINI and gemini_client):
+        return 4, "فصحى جيدة"
     sp = "أنت مُصحّح لغة عربية فصحى للأطفال. 1) الفصحى = MSA 2) العامية = خصم 3) كلمات أجنبية = 0 4) التشكيل لا يغير التقييم 5) كن عادلاً للأطفال"
     if challenge == "story": task = f"قيّم قصة الطفل.\nالموضوع: {topic}\nالقصة: {answer}\n5=ممتازة 4=جيدة 3=بسيطة 2=مزيج 1=عامية 0=ليست عربية"
     elif challenge == "question": task = f"قيّم الإجابة (كلمة مقبولة).\nالموضوع: {topic}\nالإجابة: {answer}\n5=صحيحة 4=ناقصة 3=بسيطة 2=مزيج 1=عامية 0=خاطئة"
@@ -482,11 +534,9 @@ def ai_fusha(answer, topic, challenge):
     else: task = f"قيّم الوصف.\nالموضوع: {topic}\nالوصف: {answer}\n5=غني 4=جيد 3=بسيط 2=مزيج 1=عامية 0=ليست عربية"
     prompt = sp + "\n\n" + task + '\n\nأعد JSON: {"score":4,"comment":"تعليق"}'
     try:
-        if USE_GEMINI:
-            r = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt,
-                config={"temperature":0.1,"max_output_tokens":200,"response_mime_type":"application/json"})
-            text = r.text.strip()
-        else: return 4, "فصحى جيدة"
+        r = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt,
+            config={"temperature":0.1,"max_output_tokens":200,"response_mime_type":"application/json"})
+        text = r.text.strip()
         text = re.sub(r"```(?:json)?", "", text).strip()
         s = text.find("{"); e = text.rfind("}") + 1
         data = json.loads(text[s:e])
@@ -497,15 +547,8 @@ def ai_fusha(answer, topic, challenge):
         _ANSWER_CACHE[cache_key] = result
         return result
     except Exception as e:
-        print("AI failed:", e)
+        print(f"Gemini failed: {e}")
         return 4, "فصحى جيدة"
-
-class SpeakEval(BaseModel):
-    image_description: str = ""
-    user_transcript: str = ""
-    elements: list = []
-    topic: str = ""
-    challenge: str = "describe"
 
 @app.post("/speak/evaluate")
 def speak_evaluate(req: SpeakEval):
@@ -545,11 +588,7 @@ def speak_evaluate(req: SpeakEval):
         "matched_count":mr["matched_count"],"total_elements":mr["total"],
         "grade":g,"grade_desc":gd,"praise":praise,"recommendation":rec,"overall":ov}
 
-# ============================================================
 # ============ MINI-GAMES ============
-# ============================================================
-
-# ---- GAME 1: DIRECTION DRAGON ----
 
 DRAGON_WORDS = [
     {"ar": "يَمِين", "translit": "yameen", "meaning": "right", "dir": "right"},
@@ -564,7 +603,6 @@ class DragonLevel(BaseModel):
 
 @app.post("/minigame/dragon/new")
 def dragon_new(req: DragonLevel):
-    """Generate a new dragon level with random target positions."""
     num_targets = 3 + min(2, req.level // 3)
     size = 5 + min(2, req.level // 4)
     dragon = {"x": size//2, "y": size//2}
@@ -588,7 +626,6 @@ class DragonCheck(BaseModel):
 
 @app.post("/minigame/dragon/check")
 def dragon_check(req: DragonCheck):
-    """Check if the child said the right direction word."""
     spoken = normalize_arabic(req.spoken or "")
     matched_word = None
     for w in DRAGON_WORDS:
@@ -625,12 +662,10 @@ def dragon_done(req: DragonDone):
         "accuracy": round(accuracy*100, 0),
         "new_achievements": [{"id":a, **ACHIEVEMENTS[a]} for a in new_ach]}
 
-# ---- GAME 2: WORD SCRAMBLE ----
-
 SCRAMBLE_WORDS = {
-    1: [("مَاء","ماء"),("بَيْت","بيت"),("نَار","نار"),("شَمْس","شمس"),("قَمَر","قمر"),("قِطّ","قط"),("كَلْب","كلب"),("وَرْد","ورد")],
-    2: [("مَدْرَسَة","مدرسة"),("مَطْعَم","مطعم"),("شَجَرَة","شجرة"),("كِتَاب","كتاب"),("سَمَكَة","سمكة"),("طَائِر","طائر"),("زَهْرَة","زهرة")],
-    3: [("مُسْتَشْفَى","مستشفى"),("مَكْتَبَة","مكتبة"),("حَدِيقَة","حديقة"),("سَيَّارَة","سيارة"),("مَزْرَعَة","مزرعة"),("مَلْعَب","ملعب")],
+    1: [("مَاء","ماء"),("بَيْت","بيت"),("نَار","نار"),("شَمْس","شمس"),("قَمَر","قمر"),("قِطّ","قط"),("كَلْب","كلب")],
+    2: [("مَدْرَسَة","مدرسة"),("مَطْعَم","مطعم"),("شَجَرَة","شجرة"),("كِتَاب","كتاب"),("سَمَكَة","سمكة"),("طَائِر","طائر")],
+    3: [("مُسْتَشْفَى","مستشفى"),("مَكْتَبَة","مكتبة"),("حَدِيقَة","حديقة"),("سَيَّارَة","سيارة"),("مَزْرَعَة","مزرعة")],
 }
 
 class ScrambleLevel(BaseModel):
@@ -648,7 +683,7 @@ def scramble_new(req: ScrambleLevel):
     while "".join(scrambled) == plain and len(letters) > 1:
         random.shuffle(scrambled)
     return {"scrambled": scrambled, "word_length": len(plain),
-        "hint_first": plain[0], "hint_last": plain[-1], "difficulty": diff}
+        "hint_first": plain[0], "hint_last": plain[-1], "difficulty": diff, "answer": plain}
 
 class ScrambleCheck(BaseModel):
     student_name: str = ""
@@ -692,15 +727,12 @@ def scramble_done(req: ScrambleDone):
         "accuracy": round(accuracy*100, 0),
         "new_achievements": [{"id":a, **ACHIEVEMENTS[a]} for a in new_ach]}
 
-# ---- GAME 3: STORY BUILDER ----
-
 STORY_PUZZLES = [
     {"pics": ["🐱","🐟","😋"], "words": ["القطة","أكلت","السمكة"], "answer": "القطة أكلت السمكة", "hint": "من أكل ماذا؟"},
     {"pics": ["👦","🏫","📚"], "words": ["الولد","ذهب","إلى المدرسة"], "answer": "الولد ذهب إلى المدرسة", "hint": "أين ذهب الولد؟"},
     {"pics": ["🌞","🐦","🎵"], "words": ["الشمس","أشرقت","والطيور تغني"], "answer": "الشمس أشرقت والطيور تغني", "hint": "ماذا حدث في الصباح؟"},
     {"pics": ["👧","🌸","😊"], "words": ["البنت","قطفت","الزهرة"], "answer": "البنت قطفت الزهرة", "hint": "ماذا فعلت البنت؟"},
     {"pics": ["🚗","🛣️","🏠"], "words": ["السيارة","سارت","على الطريق"], "answer": "السيارة سارت على الطريق", "hint": "أين سارت السيارة؟"},
-    {"pics": ["🌧️","☂️","👦"], "words": ["المطر","نزل","والصبي فتح المظلة"], "answer": "المطر نزل والصبي فتح المظلة", "hint": "ماذا فعل الصبي؟"},
 ]
 
 class StoryLevel(BaseModel):
@@ -711,7 +743,7 @@ class StoryLevel(BaseModel):
 def story_new(req: StoryLevel):
     puzzle = random.choice(STORY_PUZZLES)
     return {"pictures": puzzle["pics"], "words": puzzle["words"],
-        "hint": puzzle["hint"], "answer_length": len(puzzle["answer"].split())}
+        "hint": puzzle["hint"], "answer": puzzle["answer"]}
 
 class StoryCheck(BaseModel):
     student_name: str = ""
@@ -751,8 +783,6 @@ def story_done(req: StoryDone):
     return {"ok": True, "score": score, "coins_earned": coins, "total_coins": s["coins"],
         "accuracy": round(accuracy*100, 0),
         "new_achievements": [{"id":a, **ACHIEVEMENTS[a]} for a in new_ach]}
-
-# ---- GAME 4: SOUND MATCH ----
 
 SOUND_LEVELS = {
     1: [("خَ","خ"),("حَ","ح"),("عَ","ع"),("غَ","غ"),("قَ","ق"),("كَ","ك")],
@@ -821,16 +851,10 @@ def minigames_list():
         {"id":"sound","name":"مطابقة الصوت","icon":"🎵","desc":"كرر ما تسمعه"},
     ]}
 
-# ============ WARMUP ============
-
 @app.on_event("startup")
 def warmup():
-    if USE_GEMINI:
-        print("Using Gemini (" + GEMINI_MODEL + ")")
-        try:
-            gemini_client.models.generate_content(model=GEMINI_MODEL, contents="مرحبا")
-            print("Gemini ready")
-        except Exception as e:
-            print("Gemini warmup failed:", e)
-    else:
-        print("⚠️ GEMINI_API_KEY not set!")
+    print("=" * 50)
+    print(f"CORS: enabled for all origins")
+    print(f"Gemini: {'ready' if USE_GEMINI else 'NOT available (fallback mode)'}")
+    print("Baligh API is starting...")
+    print("=" * 50)
